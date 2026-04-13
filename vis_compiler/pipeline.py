@@ -16,7 +16,11 @@ from vis_compiler.tiling import TilingPlan, plan_all
 class PipelineConfig:
     dump_relay_path: Optional[str] = None
     dump_layers_path: Optional[str] = None
+    dump_instructions_path: Optional[str] = None
     run_optimize: bool = True
+    finalize_instructions: bool = True
+    # None = run FoldConstant only if tvm.runtime.enabled("llvm")
+    fold_constant: Optional[bool] = None
 
 
 @dataclass
@@ -46,7 +50,11 @@ class CompilerPipeline:
         res = StageResult(mod=mod, params=params)
 
         if self.config.run_optimize:
-            res.mod, res.params = relay_opt.optimize_for_codegen(res.mod, res.params)
+            res.mod, res.params = relay_opt.optimize_for_codegen(
+                res.mod,
+                res.params,
+                fold_constant=self.config.fold_constant,
+            )
         for h in self._hooks.get("after_opt", []):
             h(res)
 
@@ -72,7 +80,16 @@ class CompilerPipeline:
         for h in self._hooks.get("after_tile", []):
             h(res)
 
-        res.instructions = emit_program(res.layers, res.tilings)
+        res.instructions = emit_program(
+            res.layers,
+            res.tilings,
+            finalize=self.config.finalize_instructions,
+        )
+
+        if self.config.dump_instructions_path:
+            with open(self.config.dump_instructions_path, "w", encoding="utf-8") as f:
+                for inst in res.instructions:
+                    f.write(str(inst) + "\n")
 
         for h in self._hooks.get("after_emit", []):
             h(res)

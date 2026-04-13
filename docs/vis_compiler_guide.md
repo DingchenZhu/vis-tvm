@@ -18,11 +18,13 @@ A **stage-based pipeline** (not a single monolithic script) that:
 
 4. **Applies tiling decisions** *before* instruction emission (`tiling.py`), following the ideas in `unet_fsrcnn_tiling_and_codegen_guide.md` (e.g. H blocks, W macro tiles of 128 when width is large, 4-row vs 6-row line-buffer behavior, deformable branches with ky/ic-style grouping).
 
-5. **Emits hardware micro-instructions** via the same ISA wrappers as the reference (`emit/isa.py`: `DataLoader`, `WeightLoader`, `OffsetLoader`, `QuantLoader`, `DataStorer`, etc.) and a pluggable **`InstructionEmitter`** (`emit/emitter.py`).
+5. **Emits hardware micro-instructions** via the same ISA wrappers as the reference (`emit/isa.py`: `DataLoader`, `WeightLoader`, `OffsetLoader`, `QuantLoader`, `DataStorer`, etc.) and a pluggable **`InstructionEmitter`** (`emit/emitter.py`). Raw records include **golden-style ISA fields** where needed (`is_compression`, `offchip_read_mode`, `is_skip`, `is_offset`, …).
 
-6. **Tests** under `tests/` validate tiling numbers, layer extraction, that optimization keeps deformable ops, deformable emission includes `OffsetLoader` and bilinear `WeightLoader`, and pipeline JSON/Relay dumps.
+6. **Instruction post-pass** (`emit/post_pass.py`): after emission, the default pipeline runs **`finalize_instructions()`** — the same logical steps as the tail of `references/sd_sr_codegen.py`: **dependency edges** (`dependency`), **virtual registers** (`dest`, `src1`–`src4`), and **field alignment** for encoders. This produces dicts comparable in shape to `golden/pseudo_code_*.txt` (one `str(dict)` per line when dumped).
 
-7. **Demo script** `scripts/run_compiler_demo.py` runs ONNX (if present) through the full pipeline and traces FSRCNN to a Relay text dump.
+7. **Tests** under `tests/` validate tiling numbers, layer extraction, that optimization keeps deformable ops, deformable emission includes `OffsetLoader` and bilinear `WeightLoader`, pipeline JSON/Relay dumps, and **post-pass idempotence** on compiler-emitted streams (`tests/test_post_pass.py`).
+
+8. **Scripts:** `scripts/run_compiler_demo.py` (full pipeline + optional pseudo-code dump); `scripts/dump_sd_inst_pseudo_code.py` (reference **`sd_inst`** + same post-pass for diffing against goldens); `scripts/verify_golden_post_pass.py` (round-trip check only when a golden file starts at `code_num` `[0]` — repository slices are skipped by design).
 
 ---
 
@@ -55,8 +57,10 @@ mod, params = load_onnx(
 
 cfg = PipelineConfig(
     run_optimize=True,
-    dump_relay_path="out/relay_optimized.txt",      # optional
-    dump_layers_path="out/layers_and_tiling.json",  # optional
+    dump_relay_path="out/relay_optimized.txt",       # optional
+    dump_layers_path="out/layers_and_tiling.json",   # optional
+    dump_instructions_path="out/pseudo_code.txt",   # optional: golden-style lines
+    finalize_instructions=True,                      # default: dependency + dest/src
 )
 pipe = CompilerPipeline(cfg)
 result = pipe.run(mod, params)
@@ -65,7 +69,7 @@ result = pipe.run(mod, params)
 # result.params       — parameter dict
 # result.layers       — list[LayerDesc]
 # result.tilings      — list[TilingPlan] (one per layer)
-# result.instructions — list of dicts (op_code, fields, …)
+# result.instructions — list of dicts (ISA fields + dependency/dest/src* if finalize_instructions=True)
 ```
 
 **PyTorch (FSRCNN):**
@@ -86,7 +90,93 @@ dump_relay(mod, "out/fsrcnn_relay.txt")
 python scripts/run_compiler_demo.py --onnx /path/to/USR_Net.onnx --out output/demo
 ```
 
+Optional **golden-style pseudo-code** (one Python `repr(dict)` per line, after post-pass):
+
+```bash
+python scripts/run_compiler_demo.py --onnx /path/to/model.onnx --out output/demo \
+  --pseudo-out output/demo/usr_net_pseudo_code.txt
+```
+
 If the default ONNX path does not exist, the script skips USR_Net but still tries FSRCNN and writes `fsrcnn_relay.txt` under `--out`.
+
+### Full pipeline — stages and `StageResult`
+
+End-to-end flow:
+
+| Order | Stage | Module / entry | Output |
+|------|--------|------------------|--------|
+| 1 | Relay optimize (optional) | `relay_opt.optimize_for_codegen` | `mod`, `params` |
+| 2 | Layer extraction | `extract_layer_descs(mod)` | `layers: list[LayerDesc]` |
+| 3 | Tiling | `plan_all(layers)` | `tilings: list[TilingPlan]` |
+| 4 | Emit + finalize | `emit_program(layers, tilings, finalize=…)` | `instructions: list[dict]` |
+
+**`CompilerPipeline.run(mod, params)`** returns **`StageResult`** with:
+
+| Field | Meaning |
+|--------|---------|
+| `mod` | Optimized `IRModule` (if `run_optimize=True`) |
+| `params` | Weights / params dict |
+| `layers` | Ordered `LayerDesc` list |
+| `tilings` | One `TilingPlan` per layer |
+| `instructions` | Micro-op dicts; with default config, each includes **`dependency`**, **`dest`**, **`src1`–`src4`** after post-pass |
+
+### `PipelineConfig` (dumps and post-pass)
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `run_optimize` | `True` | Run `relay_opt` before extraction |
+| `dump_relay_path` | `None` | Write optimized Relay text after stage 1 |
+| `dump_layers_path` | `None` | Write `layers` + `tiling` JSON after stage 3 |
+| `dump_instructions_path` | `None` | Write finalized instructions (`str(dict)` per line) after stage 4 |
+| `finalize_instructions` | `True` | Run `finalize_instructions()` on the emitted list; set `False` for raw ISA dicts only |
+
+Programmatic example with all dumps:
+
+```python
+cfg = PipelineConfig(
+    run_optimize=True,
+    dump_relay_path="out/relay.txt",
+    dump_layers_path="out/layers.json",
+    dump_instructions_path="out/pseudo_code.txt",
+    finalize_instructions=True,
+)
+```
+
+To emit **without** dependency/register fields (debug only):
+
+```python
+from vis_compiler.emit.emitter import emit_program
+raw = emit_program(layers, tilings, finalize=False)
+```
+
+### Golden-compatible pseudo-code — what matches `golden/*.txt` and what does not
+
+**What was added for parity with the legacy dump format**
+
+- **`vis_compiler/emit/post_pass.py`:** `finalize_instructions()` = dependency pass + register assignment + `align_instruction_fields`, ported from `references/sd_sr_codegen.py` (`__main__` block).
+- **`vis_compiler/emit/isa.py`:** Extra fields on dispatched records (`is_compression` on Offchip loaders/storer, `offchip_read_mode` / `is_compression` on `DataLoader`, `is_skip` on `WeightLoader`, `is_offset` on `DataStorer`).
+- **`emit_program` / `CompilerPipeline`:** Finalize on by default; optional instruction dump path.
+
+**How to get instructions *like* the repository goldens**
+
+The files under `golden/pseudo_code_*.txt` come from the **hand-written** UNet+FSRCNN schedule in **`references/sd_sr_codegen.py`** (e.g. `sd_inst`, `sr_inst`), not from ONNX→Relay→`vis_compiler` today. The post-pass only annotates an **existing** raw stream; it does not build that full schedule.
+
+1. **Closest to legacy golden (recommended for diff / regression):** emit from **`sd_inst`** and use the **same** post-pass as the compiler:
+
+   ```bash
+   conda activate hhb
+   export PYTHONPATH=/path/to/tvm/python:/path/to/tvm-tiling:references
+   cd /path/to/tvm-tiling
+   python scripts/dump_sd_inst_pseudo_code.py -o /tmp/sd_pseudo.txt --is-first --load-next
+   ```
+
+   Optional **`--slice-from` / `--slice-to`** if your golden is a window of the full trace. Compare with `diff` against `golden/pseudo_code_load_next_first.txt`. Byte-identical match requires the **same raw codegen snapshot** (and slice) as when the golden was produced; small differences in `WeightLoader.is_new` or layer boundaries may still appear across revisions.
+
+2. **From the TVM pipeline (USR_Net / other ONNX):** use `PipelineConfig.dump_instructions_path` or `--pseudo-out`. You get **the same dict shape** (post-pass fields included), but the **opcode sequence and counts** will differ from `golden/*.txt` until the emitter implements the full legacy schedule (or you add a dedicated “reference schedule” backend).
+
+3. **Automated verify:** `python scripts/verify_golden_post_pass.py` **round-trips** only files whose **first** instruction has `code_num` `[0]`. The current repository goldens **start at a higher `code_num`** (sliced traces), so the script reports **SKIP** — use the reference dump + slice workflow instead.
+
+**Summary:** Same **format** as golden → use the compiler’s **finalize** path (default). Same **content** as a specific golden file → generate the **same raw `sd_sr`-style stream**, then finalize (or refresh the golden from `dump_sd_inst_pseudo_code.py`).
 
 ### Pipeline Hooks (extension point)
 
@@ -128,12 +218,13 @@ With `dump_layers_path` set, the pipeline writes a JSON array of objects combini
 
 ### Instruction list
 
-`result.instructions` is a Python list of dicts, one per emitted micro-op (`op_code`, `code_num`, and ISA fields).
+`result.instructions` is a Python list of dicts, one per emitted micro-op. With **`finalize_instructions=True`** (default), each dict includes ISA fields plus **`dependency`** (list of producer indices), **`dest`**, and **`src1`–`src4`** (virtual registers), in the same style as `golden/pseudo_code_*.txt`. With **`finalize_instructions=False`**, only the fields produced by `emit/isa.py` `dispatch` are present.
 
 **What to check:**
 
 - Opcode histogram (e.g. count `DataLoader` / `WeightLoader` / `OffsetLoader`).
 - For a small single-layer test, compare structure qualitatively to the reference scripts (`references/sd_codegen.py`, `references/sd_sr_codegen.py`).
+- For legacy parity, compare dumps from `scripts/dump_sd_inst_pseudo_code.py` (see §2 — Golden-compatible pseudo-code).
 
 ### Automated tests
 
@@ -210,9 +301,12 @@ tvm-tiling/
       __init__.py
       isa.py             # Inst, *Loader.dispatch
       emitter.py         # InstructionEmitter, emit_program
-  tests/                 # unit checks
+      post_pass.py       # finalize_instructions (deps + regs + field align)
+  tests/                 # unit checks (incl. test_post_pass.py)
   scripts/
     run_compiler_demo.py
+    dump_sd_inst_pseudo_code.py   # sd_inst + same post-pass as compiler
+    verify_golden_post_pass.py    # round-trip verify if golden starts at code_num 0
   docs/
     vis_compiler_guide.md    # this file
     unet_fsrcnn_*.md           # architecture + tiling reference
@@ -258,7 +352,7 @@ These are improvements to **compiler quality, maintainability, and confidence** 
 ### 7.1 Correctness and observability
 
 - **Unsupported Relay nodes are skipped silently** in `extract_layer_descs()`. Add an optional **diagnostic mode** (e.g. `PipelineConfig.warn_unsupported_ops=True` or a separate `relay_walk` report) that lists every `Call` op name not mapped to `LayerDesc`, with source span if available. That prevents “empty or partial layer list” surprises when you swap models.
-- **Golden / structural tests against `references/sd_*.py`**: For one fixed small layer (e.g. single `conv2d` with known H/W/Cin/Cout), compare opcode sequences and critical fields (transnum, line_buffer, read_mode) to the handwritten reference. This catches regressions when you refactor the emitter.
+- **Golden / structural tests against `references/sd_*.py`**: For one fixed small layer (e.g. single `conv2d` with known H/W/Cin/Cout), compare opcode sequences and critical fields (transnum, line_buffer, read_mode) to the handwritten reference. The compiler now shares **`finalize_instructions`** with the legacy script; compare **raw** emit + finalize to `scripts/dump_sd_inst_pseudo_code.py` output for schedule-level parity (see §2).
 - **Explicit “supported subset” manifest**: A single table (in code or doc) listing supported Relay ops and known limitations (NCHW, static batch, etc.) that tests or CI can cross-check.
 
 ### 7.2 Tiling and templates
@@ -348,4 +442,4 @@ A practical sequence that balances **risk** and **usable milestones**. Adjust ph
 
 ---
 
-*Last updated to match the `vis_compiler` package as implemented under `tvm-tiling/`, including optimization notes, development advice, and roadmap (§7–§9).*
+*Last updated to match the `vis_compiler` package as implemented under `tvm-tiling/`, including instruction post-pass, golden-format dumps, full pipeline/`PipelineConfig` usage (§2), optimization notes, development advice, and roadmap (§7–§9).*

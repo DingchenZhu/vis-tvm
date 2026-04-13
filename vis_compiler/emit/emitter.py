@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from vis_compiler.emit import isa
+from vis_compiler.emit.post_pass import finalize_instructions
 from vis_compiler.layer_desc import LayerDesc
 from vis_compiler.tiling import TilingPlan
 
@@ -125,7 +126,7 @@ class InstructionEmitter:
                 line_buffer_idx=st.line_buffer_idx,
                 is_padding_col=1,
                 weight_parall_mode=plan.weight_parall_mode,
-                is_new=0,
+                is_new=1,
                 transnum=plan.weight_transnum_base,
                 bas_addr=st.weight_bas_addr[0],
                 is_bilinear_bicubic=plan.use_bilinear_weights,
@@ -245,10 +246,22 @@ class InstructionEmitter:
         st.weight_bas_addr[0] += 12 * plan.ky_outer * plan.ic_inner
 
 
-def emit_program(layers: List[LayerDesc], plans: List[TilingPlan]) -> List[Dict[str, Any]]:
-    """Convenience: full network (caller orders layers)."""
+def emit_program(
+    layers: List[LayerDesc],
+    plans: List[TilingPlan],
+    *,
+    finalize: bool = True,
+) -> List[Dict[str, Any]]:
+    """Convenience: full network (caller orders layers).
+
+    When ``finalize`` is True, run dependency + virtual register assignment and
+    encoder field alignment (golden-compatible dict shape).
+    """
     em = InstructionEmitter()
     em.reset()
     for L, P in zip(layers, plans):
         em.emit_layer(L, P)
-    return list(isa.Inst.code_list)
+    raw: List[Dict[str, Any]] = list(isa.Inst.code_list)
+    if finalize:
+        finalize_instructions(raw)
+    return raw
