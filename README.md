@@ -123,6 +123,3 @@ pytest tests/
 | `references/` | Legacy ISA wrappers and monolithic codegen (comparison / porting source) |
 | `golden/` | Reference pseudo-instruction text dumps |
 
-## License / upstream
-
-TVM is Apache-licensed; this repo’s layout follows your internal accelerator codegen effort. Point TVM at your own checkout or release as needed.
